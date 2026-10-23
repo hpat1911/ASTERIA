@@ -106,7 +106,6 @@ The current prototype contains some hardcoded parameters such as time period, sy
 The gravity-darkening temperature-map implementation remains under development. Numerical convergence and physical consistency require further validation.
 
 Note some program changes and debugging may lead to slightly different outcomes than those described in the synopsis. The presented results (based on input data from cited sources and AAVSO VSX and AVSPEC) of the synopsis are based on slightly older prototypes of the code.
-## Validation and Development Status
 
 Earlier development versions of ASTERIA were compared with published parameters for six eclipsing binary systems: β Lyrae, β Persei, V356 Sagittarii, RY Scuti, TT Hydrae,
 and U Cephei.

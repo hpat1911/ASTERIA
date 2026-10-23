@@ -1,0 +1,559 @@
+"""
+Diagnostic Computational Eclipsing-Binary Modelling Pipeline (Full 2D & 3D Edition)
+Includes: Kinematic Parameter Sweep, Fourier Flux Equation, 
+Corrected Photometric Luminosity Coupling, and Dynamic Continuous Beta Mapping.
+"""
+
+from dataclasses import dataclass
+from typing import Optional, Tuple
+import numpy as np
+from scipy.integrate import solve_ivp
+from scipy.optimize import brentq
+import os
+import matplotlib.pyplot as plt
+from matplotlib import cm
+
+# ============================================================
+# PHYSICAL CONSTANTS (SI)
+# ============================================================
+G = 6.67430e-11          
+K_B = 1.380649e-23       
+SIGMA_SB = 5.670374e-8   
+M_SUN = 1.98847e30       
+R_SUN = 6.957e8          
+L_SUN = 3.828e26         
+M_H = 1.6735575e-27      
+DAY = 86400.0            
+YEAR = 365.25 * DAY      
+
+@dataclass
+class SystemParameters:
+    period_days: float
+    luminosity_Lsun: float
+    K1_kms: float = 0.0             
+    K2_kms: float = 0.0             
+    dP_dt_s_per_year: float = 0.0   
+    inclination_deg: float = 90.0   
+    eccentricity: float = 0.0
+    mean_molecular_weight: float = 1.2
+    gamma_gas: float = 5.0 / 3.0
+    gainer_radius_Rsun: float = 6.0
+    manual_donor_l_sun: Optional[float] = None
+
+@dataclass
+class OrbitalSolution:
+    q: float
+    a1_m: float
+    a2_m: float
+    a_m: float
+    total_mass_kg: float
+    M1_kg: float
+    M2_kg: float
+    omega_rad_s: float
+    barycenter_x_m: float
+
+
+# ============================================================
+# KINEMATIC SENSITIVITY SWEEP (i & e)
+# ============================================================
+def run_kinematic_sweep(P_days: float, K1_kms: float, K2_kms: float, steps: int = 41) -> dict:
+    P_sec = P_days * DAY
+    K_sum = (K1_kms + K2_kms) * 1000.0
+    q = K2_kms / K1_kms  
+    
+    i_deg = np.linspace(80.0, 90.0, steps)
+    e_vals = np.linspace(0.0, 0.20, steps)
+    I, E = np.meshgrid(np.radians(i_deg), e_vals)
+    
+    a_m = (P_sec * K_sum * np.sqrt(1.0 - E**2)) / (2.0 * np.pi * np.sin(I))
+    M_tot = (P_sec * (K_sum**3) * ((1.0 - E**2)**1.5)) / (2.0 * np.pi * G * (np.sin(I)**3))
+    
+    M_donor = (q / (1.0 + q)) * M_tot / M_SUN
+    M_gainer = (1.0 / (1.0 + q)) * M_tot / M_SUN
+    a_Rsun = a_m / R_SUN
+    
+    return {
+        "M_donor_range": (np.min(M_donor), np.max(M_donor)),
+        "M_gainer_range": (np.min(M_gainer), np.max(M_gainer)),
+        "a_range": (np.min(a_Rsun), np.max(a_Rsun))
+    }
+
+# ============================================================
+# PHOTOMETRIC DATA REDUCTION 
+# ============================================================
+def fourier_design_matrix(phase: np.ndarray, order: int = 4) -> np.ndarray:
+    phase = np.asarray(phase, dtype=float)
+    cols = [np.ones_like(phase)]
+    for n in range(1, order + 1):
+        cols.append(np.cos(2.0 * np.pi * n * phase))
+        cols.append(np.sin(2.0 * np.pi * n * phase))
+    return np.column_stack(cols)
+
+def fourier_ols(phase: np.ndarray, magnitude: np.ndarray, order: int = 4) -> Tuple[np.ndarray, float]:
+    mask = np.isfinite(phase) & np.isfinite(magnitude)
+    p_clean = np.asarray(phase[mask], dtype=float)
+    m_clean = np.asarray(magnitude[mask], dtype=float)
+
+    raw_flux = 10.0 ** (-0.4 * (m_clean - np.min(m_clean)))
+    baseline = np.percentile(raw_flux, 99) 
+    flux = raw_flux / baseline
+
+    M = fourier_design_matrix(p_clean, order)
+    beta, *_ = np.linalg.lstsq(M, flux, rcond=None)
+    residuals = flux - M @ beta
+    return beta, float(np.sum(residuals**2))
+
+def get_fourier_equation(beta: np.ndarray, order: int = 4) -> str:
+    eq = f"F(φ) = {beta[0]:.4f}"
+    for n in range(1, order + 1):
+        A = beta[2 * n - 1]
+        B = beta[2 * n]
+        if abs(A) > 1e-4:
+            eq += f" {'+' if A > 0 else '-'} {abs(A):.4f}*cos({n}*2πφ)"
+        if abs(B) > 1e-4:
+            eq += f" {'+' if B > 0 else '-'} {abs(B):.4f}*sin({n}*2πφ)"
+    return eq
+
+def evaluate_fourier(phi: np.ndarray, beta: np.ndarray, order: int = 4) -> np.ndarray:
+    return fourier_design_matrix(phi, order) @ beta
+
+def extract_morphology(beta: np.ndarray, order: int = 4) -> dict:
+    phi_grid = np.linspace(0.0, 1.0, 1000)
+    f_grid = evaluate_fourier(phi_grid, beta, order)
+    
+    f_min1 = np.min(f_grid[(phi_grid < 0.15) | (phi_grid > 0.85)])
+    f_min2 = np.min(f_grid[(phi_grid > 0.35) & (phi_grid < 0.65)])
+    f_max = np.max(f_grid)
+    return {"depth_1": f_max - f_min1, "depth_2": f_max - f_min2, "f_max": f_max}
+
+def compute_coupled_luminosity(morphology: dict, R_gainer: float, R_donor: float, L_total: float) -> Tuple[float, float]:
+    d1 = max(1e-4, morphology["depth_1"])
+    d2 = max(1e-4, morphology["depth_2"])
+    
+    # FIXED: Beta Lyrae Eclipse Inversion Mapping
+    # The shallower eclipse (d2) occurs when the donor is obscured.
+    sb_ratio = d2 / d1  
+    area_ratio = (R_donor / R_gainer)**2 
+    lum_ratio = sb_ratio * area_ratio # L_donor / L_gainer
+    
+    donor_frac = 1-(lum_ratio / (1.0 + lum_ratio))
+    return donor_frac * L_total, donor_frac
+
+# ============================================================
+# SPECTROSCOPY, ORBIT, & ROCHE MODEL
+# ============================================================
+def derive_orbit(params: SystemParameters) -> OrbitalSolution:
+    K1, K2 = params.K1_kms * 1e3, params.K2_kms * 1e3
+    P = params.period_days * DAY
+    sin_i = np.sin(np.deg2rad(params.inclination_deg))
+    ecc_factor = np.sqrt(1.0 - params.eccentricity**2)
+    
+    a1 = K1 * P * ecc_factor / (2.0 * np.pi * sin_i)
+    a2 = K2 * P * ecc_factor / (2.0 * np.pi * sin_i)
+    a = a1 + a2
+    Mtot = (4.0 * np.pi**2 * a**3) / (G * P**2)
+    q = K2 / K1
+    
+    return OrbitalSolution(
+        q=q, a1_m=a1, a2_m=a2, a_m=a, total_mass_kg=Mtot, 
+        M1_kg=(q / (1.0 + q)) * Mtot, M2_kg=(1.0 / (1.0 + q)) * Mtot,
+        omega_rad_s=2.0 * np.pi / P, barycenter_x_m=((1.0 / (1.0 + q)) * Mtot / Mtot) * a
+    )
+
+class RocheModel:
+    def __init__(self, orbit: OrbitalSolution):
+        self.orbit = orbit
+        self.M1, self.M2, self.a = orbit.M1_kg, orbit.M2_kg, orbit.a_m
+        self.omega, self.x_cm = orbit.omega_rad_s, orbit.barycenter_x_m
+
+    def potential(self, x, y, z=0.0):
+        r1 = np.maximum(np.sqrt(x**2 + y**2 + z**2), 1e-12)
+        r2 = np.maximum(np.sqrt((self.a - x)**2 + y**2 + z**2), 1e-12)
+        return -G * self.M1 / r1 - G * self.M2 / r2 - 0.5 * self.omega**2 * ((x - self.x_cm)**2 + y**2)
+
+    def lagrange_points(self):
+        eps = self.a * 1e-7
+        def force(x):
+            return G * self.M1 * x / (abs(x)**3) + G * self.M2 * (x - self.a) / (abs(x - self.a)**3) - self.omega**2 * (x - self.x_cm)
+        return {
+            "L1": (brentq(force, eps, self.a - eps), 0.0, 0.0),
+            "L2": (brentq(force, self.a + eps, self.a * 5.0), 0.0, 0.0),
+            "L3": (brentq(force, -self.a * 5.0, -eps), 0.0, 0.0),
+            "L4": (self.a / 2.0, np.sqrt(3.0) * self.a / 2.0, 0.0),
+            "L5": (self.a / 2.0, -np.sqrt(3.0) * self.a / 2.0, 0.0),
+        }
+
+    def donor_surface_radius(self, nx, ny, nz, xL1):
+        phi_L1 = self.potential(xL1, 0.0, 0.0)
+        if nx > 0.99999 and abs(ny) < 1e-5 and abs(nz) < 1e-5: return xL1
+        def f(r): return self.potential(r * nx, r * ny, r * nz) - phi_L1
+        
+        r_max = xL1
+        while f(1e-4 * self.a) * f(r_max) > 0 and r_max > 1e-4 * self.a:
+            r_max *= 0.95
+        try: return brentq(f, 1e-4 * self.a, r_max)
+        except: return np.nan
+
+    def donor_geometry(self, n_theta=80, n_phi=160):
+        points = self.lagrange_points()
+        xL1 = points["L1"][0]
+        TH, PH = np.meshgrid(np.linspace(0.001, np.pi - 0.001, n_theta), np.linspace(0.0, 2.0 * np.pi, n_phi), indexing="ij")
+        R = np.full_like(TH, np.nan, dtype=float)
+        
+        for i in range(n_theta):
+            for j in range(n_phi):
+                r = self.donor_surface_radius(np.sin(TH[i, j]) * np.cos(PH[i, j]), np.sin(TH[i, j]) * np.sin(PH[i, j]), np.cos(TH[i, j]), xL1)
+                if np.isfinite(r): R[i, j] = r / R_SUN
+        return {"theta": TH, "phi": PH, "R_Rsun": R, "X_Rsun": R * np.sin(TH) * np.cos(PH), "Y_Rsun": R * np.sin(TH) * np.sin(PH), "Z_Rsun": R * np.cos(TH), "lagrange": points, "xL1_m": xL1}
+
+def donor_dimensions(geometry: dict, roche: RocheModel) -> dict:
+    R, TH, PH, xL1 = geometry["R_Rsun"], geometry["theta"], geometry["phi"], geometry["xL1_m"]
+    integrand_v = np.where(np.isfinite(R), (R**3 * np.sin(TH)) / 3.0, 0.0)
+    R_vol = (3.0 * float(np.trapezoid(np.trapezoid(integrand_v, PH[0, :], axis=1), TH[:, 0])) / (4.0 * np.pi))**(1.0 / 3.0)
+    
+    dR_dth, dR_dph = np.gradient(R, TH[:, 0], PH[0, :], edge_order=2)
+    safe_sin = np.where(np.abs(np.sin(TH)) < 1e-8, 1e-8, np.sin(TH))
+    integrand_a = np.where(np.isfinite(R), R**2 * np.sin(TH) * np.sqrt(1.0 + (dR_dth / R)**2 + (dR_dph / (R * safe_sin))**2), 0.0)
+    area = float(np.trapezoid(np.trapezoid(integrand_a, PH[0, :], axis=1), TH[:, 0]))
+    
+    # RESTORED: Point, Back, Side, Pole Radii
+    r_point = xL1 / R_SUN
+    r_back = roche.donor_surface_radius(-1.0, 0.0, 0.0, xL1) / R_SUN
+    r_side = roche.donor_surface_radius(0.0, 1.0, 0.0, xL1) / R_SUN
+    r_pole = roche.donor_surface_radius(0.0, 0.0, 1.0, xL1) / R_SUN
+    
+    return {"volume_radius_Rsun": R_vol, "surface_area_Rsun2": area, 
+            "point_R_Rsun": r_point, "back_R_Rsun": r_back, 
+            "side_R_Rsun": r_side, "pole_R_Rsun": r_pole}
+
+# ============================================================
+# STEFAN-BOLTZMANN & CONTINUOUS GRAVITY DARKENING
+# ============================================================
+def derive_teff_avg(luminosity_Lsun: float, surface_area_Rsun2: float) -> float:
+    return float(((luminosity_Lsun * L_SUN) / (surface_area_Rsun2 * R_SUN**2 * SIGMA_SB))**0.25)
+
+def calculate_continuous_beta(T_array: np.ndarray) -> np.ndarray:
+    beta = np.full_like(T_array, np.nan)
+    valid = np.isfinite(T_array)
+    beta[valid & (T_array >= 8500)] = 0.25
+    beta[valid & (T_array <= 6500)] = 0.08
+    mask = valid & (T_array > 6500) & (T_array < 8500)
+    if np.any(mask):
+        beta[mask] = 0.08 + (0.17 / (1.0 + np.exp(-0.005 * (T_array[mask] - 7500.0))))
+    return beta
+
+def gravity_darkening(geometry: dict, roche: RocheModel, Teff_avg_K: float) -> dict:
+    X, Y, Z = geometry["X_Rsun"] * R_SUN, geometry["Y_Rsun"] * R_SUN, geometry["Z_Rsun"] * R_SUN
+    h = 1e-5 * roche.a
+    gx = (roche.potential(X + h, Y, Z) - roche.potential(X - h, Y, Z)) / (2.0 * h)
+    gy = (roche.potential(X, Y + h, Z) - roche.potential(X, Y - h, Z)) / (2.0 * h)
+    gz = (roche.potential(X, Y, Z + h) - roche.potential(X, Y, Z - h)) / (2.0 * h)
+    gmag = np.sqrt(gx**2 + gy**2 + gz**2)
+    
+    g_pole = abs((roche.potential(0.0, 0.0, np.nanmax(Z) + h) - roche.potential(0.0, 0.0, np.nanmax(Z) - h)) / (2.0 * h))
+    
+    T_pole = Teff_avg_K
+    for _ in range(20):
+        initial_beta = calculate_continuous_beta(np.array([T_pole]))[0]
+        Tmap = T_pole * (gmag / g_pole)**initial_beta
+        for _ in range(5): 
+            beta_map = calculate_continuous_beta(Tmap)
+            Tmap = T_pole * (gmag / g_pole)**beta_map
+            
+        current_mean = np.nanmean(Tmap)
+        if abs(current_mean - Teff_avg_K) < 0.5: break
+        T_pole *= (Teff_avg_K / current_mean)
+
+    return {"g_pole": g_pole, "T_pole_K": float(T_pole), "T_min_K": float(np.nanmin(Tmap)), "Tmap_K": Tmap, "beta_map": beta_map}
+
+# ============================================================
+# 2D & 3D VISUALIZATIONS
+# ============================================================
+
+def plot_fourier_fit(phase, mag, beta_fourier, fourier_eq):
+    """Plots the raw photometric data against the mathematical Fourier model."""
+    raw_flux = 10.0 ** (-0.4 * (mag - np.min(mag)))
+    baseline = np.percentile(raw_flux, 99) 
+    flux = raw_flux / baseline
+
+    phi_grid = np.linspace(0, 1, 500)
+    f_grid = evaluate_fourier(phi_grid, beta_fourier, order=4)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    # Duplicate phase to show a full continuous cycle (Phase 0 to 2)
+    ax.scatter(np.concatenate([phase, phase + 1.0]), np.concatenate([flux, flux]), 
+               color='gray', s=15, alpha=0.5, label='Observational Data')
+    ax.plot(np.concatenate([phi_grid, phi_grid + 1.0]), np.concatenate([f_grid, f_grid]), 
+            color='red', linewidth=2.5, label='Fourier Fit (4th Order)')
+    
+    ax.set_xlabel("Orbital Phase", fontsize=12)
+    ax.set_ylabel("Normalized Flux", fontsize=12)
+    ax.set_title(f"Radiative Engine: Light Curve Model\n{fourier_eq}", fontsize=11)
+    ax.legend(loc="lower right")
+    ax.grid(True, linestyle=':', alpha=0.7)
+    plt.tight_layout()
+    plt.show()
+
+def plot_equipotential_map(roche: RocheModel, orbit: OrbitalSolution, lagrange: dict):
+    """Generates the 2D contour map of the Roche potential."""
+    a_Rsun = orbit.a_m / R_SUN
+    lim_x = a_Rsun * 2.0
+    lim_y = a_Rsun * 1.5
+    X, Y = np.meshgrid(np.linspace(-lim_x*0.4, lim_x*1.1, 400), np.linspace(-lim_y*0.8, lim_y*0.8, 400))
+    
+    Z = np.zeros_like(X)
+    for i in range(X.shape[0]):
+        for j in range(X.shape[1]):
+            Z[i, j] = roche.potential(X[i, j] * R_SUN, Y[i, j] * R_SUN, 0.0)
+            
+    fig, ax = plt.subplots(figsize=(10, 8))
+    levels = np.linspace(np.min(Z), np.percentile(Z, 98), 100)
+    ax.contour(X, Y, Z, levels=levels, colors='gray', linewidths=0.5, alpha=0.6)
+    
+    # Highlight Lagrange potentials
+    for name, color in zip(['L1', 'L2', 'L3'], ['blue', 'red', 'orange']):
+        pot = roche.potential(*lagrange[name])
+        ax.contour(X, Y, Z, levels=[pot], colors=color, linewidths=1.5, linestyles='--' if name != 'L1' else '-')
+
+    ax.scatter([0], [0], color='blue', s=80, label='Donor Core', zorder=5)
+    ax.scatter([a_Rsun], [0], color='red', s=80, label='Gainer Core', zorder=5)
+    
+    lagrange_colors = {'L1': 'black', 'L2': 'darkred', 'L3': 'darkorange', 'L4': 'green', 'L5': 'green'}
+    for name, (x, y, z) in lagrange.items():
+        ax.scatter([x/R_SUN], [y/R_SUN], color=lagrange_colors[name], marker='X', s=100, zorder=5)
+        ax.text(x/R_SUN + 1.5, y/R_SUN + 1.5, name, fontsize=12, fontweight='bold')
+        
+    ax.set_aspect('equal')
+    ax.set_xlabel('X ($R_\odot$)', fontsize=12)
+    ax.set_ylabel('Y ($R_\odot$)', fontsize=12)
+    ax.set_title("Kinematic Engine: Systemic Equipotential Map", fontsize=14)
+    ax.legend(loc='upper right')
+    ax.grid(True, linestyle=':', alpha=0.6)
+    plt.tight_layout()
+    plt.show()
+def plot_3d_system(geometry: dict, temp: dict, orbit: OrbitalSolution, params: SystemParameters, lagrange: dict, disk_radius_Rsun: float = 32.10):
+    """Renders the 3D Roche lobe mesh mapped with iterative surface temperatures and the accretion disk."""
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.set_facecolor('black')
+    fig.patch.set_facecolor('black')
+
+    X, Y, Z = geometry["X_Rsun"], geometry["Y_Rsun"], geometry["Z_Rsun"]
+    Tmap = temp["Tmap_K"]
+
+    norm = plt.Normalize(vmin=np.nanmin(Tmap), vmax=np.nanmax(Tmap))
+    cmap = cm.inferno  
+    colors = cmap(norm(Tmap))
+
+    ax.plot_surface(X, Y, Z, facecolors=colors, shade=False, antialiased=True, zorder=1)
+
+    mappable = cm.ScalarMappable(norm=norm, cmap=cmap)
+    mappable.set_array(Tmap)
+    cbar = plt.colorbar(mappable, ax=ax, shrink=0.5, pad=0.1)
+    cbar.set_label('Effective Temperature (K)', color='white')
+    cbar.ax.yaxis.set_tick_params(colors='white')
+    plt.setp(plt.getp(cbar.ax.axes, 'yticklabels'), color='white')
+
+    a_Rsun = orbit.a_m / R_SUN
+    Rg = params.gainer_radius_Rsun
+    
+    # Render Gainer Core
+    u, v = np.linspace(0, 2 * np.pi, 40), np.linspace(0, np.pi, 40)
+    Xg = a_Rsun + Rg * np.outer(np.cos(u), np.sin(v))
+    Yg = Rg * np.outer(np.sin(u), np.sin(v))
+    Zg = Rg * np.outer(np.ones(np.size(u)), np.cos(v))
+    ax.plot_surface(Xg, Yg, Zg, color='deepskyblue', alpha=0.7, zorder=2)
+
+    # --- RESTORED ACCRETION DISK ---
+    if disk_radius_Rsun > Rg:
+        r_disk = np.linspace(Rg, disk_radius_Rsun, 30)
+        theta_disk = np.linspace(0, 2 * np.pi, 60)
+        R_disk, Theta_disk = np.meshgrid(r_disk, theta_disk)
+        
+        Xd = a_Rsun + R_disk * np.cos(Theta_disk)
+        Yd = R_disk * np.sin(Theta_disk)
+        Zd = np.zeros_like(Xd)
+        
+        # Render as a semi-transparent gold plane
+        ax.plot_surface(Xd, Yd, Zd, color='gold', alpha=0.4, zorder=3)
+
+    lagrange_colors = {'L1': 'white', 'L2': 'red', 'L3': 'orange', 'L4': 'lime', 'L5': 'lime'}
+    for name, (x, y, z) in lagrange.items():
+        lx, ly, lz = x/R_SUN, y/R_SUN, z/R_SUN
+        ax.scatter(lx, ly, lz, color=lagrange_colors[name], s=60, edgecolors='white', zorder=5)
+        ax.text(lx, ly + 2, lz + 2, name, color='white', fontsize=12, fontweight='bold', zorder=6)
+
+    lim = a_Rsun * 1.0  
+    ax.set_xlim(-lim*0.6, lim*1.4)
+    ax.set_ylim(-lim, lim)
+    ax.set_zlim(-lim, lim)
+    ax.set_box_aspect((1, 1, 1))
+
+    ax.set_xlabel('X ($R_\odot$)', color='white')
+    ax.set_ylabel('Y ($R_\odot$)', color='white')
+    ax.set_zlabel('Z ($R_\odot$)', color='white')
+    ax.tick_params(colors='white')
+    ax.xaxis.pane.fill = ax.yaxis.pane.fill = ax.zaxis.pane.fill = False
+    ax.grid(color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
+
+    plt.title(f"ASTERIA 3D: Dynamic $\\beta$ Temperature Map (q={orbit.q:.3f})", color='white', size=14)
+    plt.show()
+
+    # ============================================================
+# GAS DYNAMICS, MASS TRANSFER & ACCRETION DISK ESTIMATION
+# ============================================================
+
+def l1_sound_speed(params: SystemParameters, Teff_avg_K: float) -> float:
+    m_particle = params.mean_molecular_weight * M_H
+    return float(np.sqrt(params.gamma_gas * K_B * Teff_avg_K / m_particle))
+
+def conservative_mass_transfer_rate(orbit: OrbitalSolution, dP_dt_s_per_year: float) -> Tuple[float, float]:
+    if dP_dt_s_per_year == 0.0:
+        return 0.0, 0.0
+    P = 2.0 * np.pi / orbit.omega_rad_s
+    dP_dt = dP_dt_s_per_year / YEAR
+    mdot_kg_s = ((dP_dt / (3.0 * P)) * (orbit.M1_kg * orbit.M2_kg) / (orbit.M2_kg - orbit.M1_kg))
+    mdot_Msun_yr = mdot_kg_s * YEAR / M_SUN
+    return float(mdot_kg_s), float(mdot_Msun_yr)
+
+def ballistic_stream(roche: RocheModel, Teff_avg_K: float, params: SystemParameters, duration: float = 25.0) -> dict:
+    v_l1 = l1_sound_speed(params, Teff_avg_K)
+    xL1 = roche.lagrange_points()["L1"][0]
+    
+    def rhs(t, state):
+        x, y, vx, vy = state
+        r1, r2 = max(np.sqrt(x**2 + y**2), 1e-12), max(np.sqrt((x - roche.a)**2 + y**2), 1e-12)
+        ax = -G * roche.M1 * x / r1**3 - G * roche.M2 * (x - roche.a) / r2**3 + 2.0 * roche.omega * vy + roche.omega**2 * (x - roche.x_cm)
+        ay = -G * roche.M1 * y / r1**3 - G * roche.M2 * y / r2**3 - 2.0 * roche.omega * vx + roche.omega**2 * y
+        return [vx, vy, ax, ay]
+
+    sol = solve_ivp(rhs, (0.0, duration * DAY), [xL1 + 0.01 * R_SUN, 0.0, v_l1, 0.0], t_eval=np.linspace(0.0, duration * DAY, 1500), rtol=1e-8, atol=1e-8)
+    return {"x_Rsun": sol.y[0] / R_SUN, "y_Rsun": sol.y[1] / R_SUN}
+
+def estimate_accretion_disk(stream: dict, a_Rsun: float) -> float:
+    x, y = stream["x_Rsun"], stream["y_Rsun"]
+    far_side_mask = x > a_Rsun
+    if not np.any(far_side_mask):
+        return 0.0
+    x_far, y_far = x[far_side_mask], y[far_side_mask]
+    r_from_gainer = np.sqrt((x_far - a_Rsun)**2 + y_far**2)
+    return float(np.max(r_from_gainer))
+# ============================================================
+# EXECUTION & EXTERNAL DATA INPUT
+# ============================================================
+if __name__ == "__main__":
+    print("==================================================")
+    print("OBSERVATION-DRIVEN BINARY MODELLING PIPELINE")
+    print("==================================================")
+
+    system_inputs = SystemParameters(
+        period_days=12.944, luminosity_Lsun=32800,           
+        inclination_deg=86.0, eccentricity=0.0       
+    ) 
+
+# --- 1. PROMPT: KINEMATICS ---
+    if input("Enter RV semi-amplitudes manually? (y/n): ").strip().lower() == 'y':
+        system_inputs.K1_kms = float(input("Enter Donor K1 (km/s): "))
+        system_inputs.K2_kms = float(input("Enter Gainer K2 (km/s): "))
+    else:
+        system_inputs.K1_kms = 188.59
+        system_inputs.K2_kms = 42.20
+
+    print("\n--- EXECUTING (i, e) PARAMETER SWEEP ---")
+    sweep = run_kinematic_sweep(system_inputs.period_days, system_inputs.K1_kms, system_inputs.K2_kms)
+    print(f"Donor Mass Range:  {sweep['M_donor_range'][0]:.2f} to {sweep['M_donor_range'][1]:.2f} M_sun")
+    print(f"Gainer Mass Range: {sweep['M_gainer_range'][0]:.2f} to {sweep['M_gainer_range'][1]:.2f} M_sun")
+    print(f"Semi-Major Axis:   {sweep['a_range'][0]:.2f} to {sweep['a_range'][1]:.2f} R_sun\n")
+
+    # --- 2. PROMPT: PHOTOMETRY ---
+    if input("Do you want to process photometric data from CSV? (y/n): ").strip().lower() == 'y':
+        if os.path.exists("photometry_data.csv"):
+            photo_data = np.loadtxt("photometry_data.csv", delimiter=",", skiprows=1, unpack=True)
+        else:
+            print("WARNING: photometry_data.csv not found. Skipping photometry.")
+            photo_data = None
+    else:
+        photo_data = None
+
+    # --- 3. PROMPT: MANUAL LUMINOSITY OVERRIDE ---
+    if input("Beta Lyrae exception: Do you want to manually input Donor Luminosity? (y/n): ").strip().lower() == 'y':
+        system_inputs.manual_donor_l_sun = float(input("Enter Donor Luminosity (L_sun): "))
+
+    # --- EXECUTE MASTER PIPELINE ---
+    print("\nExecuting physical models and integrations. Please wait...")
+    orbit = derive_orbit(system_inputs)
+    roche = RocheModel(orbit)
+    geometry = roche.donor_geometry()
+    dims = donor_dimensions(geometry, roche)
+
+    # Resolve Energy Split
+    if system_inputs.manual_donor_l_sun is not None:
+        L_donor = system_inputs.manual_donor_l_sun
+        donor_frac = L_donor / system_inputs.luminosity_Lsun
+        fourier_eq = "Manually Overridden"
+    elif photo_data is not None:
+        p_phase, p_mag = photo_data
+        beta_fourier, _ = fourier_ols(p_phase, p_mag)
+        fourier_eq = get_fourier_equation(beta_fourier) 
+        L_donor, donor_frac = compute_coupled_luminosity(extract_morphology(beta_fourier), system_inputs.gainer_radius_Rsun, dims["volume_radius_Rsun"], system_inputs.luminosity_Lsun)
+    else:
+        L_donor = system_inputs.luminosity_Lsun * 0.40
+        fourier_eq = "No Data"
+# Temperatures & Dynamics
+    Teff_avg_donor = derive_teff_avg(L_donor, dims["surface_area_Rsun2"])
+    temp = gravity_darkening(geometry, roche, Teff_avg_donor)
+    lagrange = roche.lagrange_points()
+    
+    # Calculate Mass Transfer and Accretion Disk
+    _, mdot_Msun_yr = conservative_mass_transfer_rate(orbit, system_inputs.dP_dt_s_per_year)
+    stream_long = ballistic_stream(roche, Teff_avg_donor, system_inputs, duration=350.0)
+    disk_radius_Rsun = estimate_accretion_disk(stream_long, orbit.a_m / R_SUN)
+
+    # --- RESULTS OUTPUT ---
+    print("\n==================================================")
+    print("PIPELINE RESULTS (3D MODEL)")
+    print("==================================================")
+    print(f"K1 Derived or Input     = {system_inputs.K1_kms:.2f} km/s")
+    print(f"Mass Ratio (q)          = {orbit.q:.4f}")
+    print(f"Donor Mass (M1)         = {orbit.M1_kg / M_SUN:.3f} M_sun")
+    print(f"Gainer Mass (M2)        = {orbit.M2_kg / M_SUN:.3f} M_sun")
+    
+    print("\n--- GEOMETRICAL RADII (Donor) ---")
+    print(f"Point Radius (L1)       = {dims['point_R_Rsun']:.3f} R_sun")
+    print(f"Back Radius             = {dims['back_R_Rsun']:.3f} R_sun")
+    print(f"Side Radius             = {dims['side_R_Rsun']:.3f} R_sun")
+    print(f"Pole Radius             = {dims['pole_R_Rsun']:.3f} R_sun")
+    print(f"Vol-Equivalent Radius   = {dims['volume_radius_Rsun']:.3f} R_sun")
+    
+    print("\n--- RADIATIVE SPLIT (PHOTOMETRY) ---")
+    print(f"Fourier Flux Eq         = {fourier_eq}")
+    print(f"Total System Luminosity = {system_inputs.luminosity_Lsun:.2f} L_sun")
+    print(f"Gainer Luminosity       = {system_inputs.luminosity_Lsun - L_donor:.2f} L_sun ({(1-donor_frac)*100:.1f}%)")
+    print(f"Donor Luminosity        = {L_donor:.2f} L_sun ({donor_frac*100:.1f}%)")
+
+    print("\n--- THERMAL & DYNAMIC PROPERTIES ---")
+    print(f"Donor Base (Avg) Teff   = {Teff_avg_donor:.2f} K")
+    print(f"Donor Polar Temp        = {temp['T_pole_K']:.2f} K")
+    print(f"Donor Eq. Min Temp      = {temp['T_min_K']:.2f} K")
+    print(f"Dynamic Beta Range      = {np.nanmin(temp['beta_map']):.3f} to {np.nanmax(temp['beta_map']):.3f}")
+    print(f"Est. Disk Outer Radius  = {disk_radius_Rsun:.2f} R_sun")
+    
+    print("\n--- LAGRANGIAN POTENTIALS (SI: J/kg) ---")
+    for name in ["L1", "L2", "L3", "L4", "L5"]:
+        print(f"{name} Potential = {roche.potential(*lagrange[name]):.4e} J/kg")
+
+    # --- RENDER VISUALIZATIONS ---
+    print("\nRendering Fourier Flux Overlay... (Close window to continue)")
+    if photo_data is not None:
+        plot_fourier_fit(p_phase, p_mag, beta_fourier, fourier_eq)
+    else:
+        print("Skipping Fourier plot (No photometric data found).")
+
+    print("\nRendering Systemic Equipotential Map... (Close window to continue)")
+    plot_equipotential_map(roche, orbit, lagrange)
+
+    print("\nRendering 3D Thermometric Model... (Close window to exit)")
+    # If your pipeline still calculates the disk radius, pass it as the 6th argument here:
+    plot_3d_system(geometry, temp, orbit, system_inputs, lagrange)
+    print("==================================================")
+
